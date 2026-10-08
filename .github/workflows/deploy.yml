@@ -1,0 +1,84 @@
+name: CI/CD Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - qa
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/singh01113/is373-practical-test
+
+jobs:
+  validate-build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate files
+        run: |
+          test -f index.html
+          test -f Dockerfile
+          grep -q "IS373 Practical Test" index.html
+
+      - name: Set deployment environment
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "TAG=production" >> "$GITHUB_ENV"
+            echo "CONTAINER=is373-prod" >> "$GITHUB_ENV"
+            echo "HOST=amman-prod.134-209-120-185.sslip.io" >> "$GITHUB_ENV"
+            echo "ROUTER=is373-prod" >> "$GITHUB_ENV"
+          else
+            echo "TAG=qa" >> "$GITHUB_ENV"
+            echo "CONTAINER=is373-qa" >> "$GITHUB_ENV"
+            echo "HOST=amman-qa.134-209-120-185.sslip.io" >> "$GITHUB_ENV"
+            echo "ROUTER=is373-qa" >> "$GITHUB_ENV"
+          fi
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build -t $IMAGE:$TAG -t $IMAGE:$GITHUB_SHA .
+
+      - name: Push image
+        run: |
+          docker push $IMAGE:$TAG
+          docker push $IMAGE:$GITHUB_SHA
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          ssh deploy@${{ secrets.SERVER_HOST }} "
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin &&
+            docker pull $IMAGE:$TAG &&
+            docker rm -f $CONTAINER 2>/dev/null || true
+            docker run -d \
+              --name $CONTAINER \
+              --restart unless-stopped \
+              --network hosting-web \
+              --label 'traefik.enable=true' \
+              --label 'traefik.http.routers.$ROUTER.rule=Host(\`$HOST\`)' \
+              --label 'traefik.http.routers.$ROUTER.entrypoints=websecure' \
+              --label 'traefik.http.routers.$ROUTER.tls=true' \
+              --label 'traefik.http.routers.$ROUTER.tls.certresolver=letsencrypt' \
+              --label 'traefik.http.services.$ROUTER.loadbalancer.server.port=80' \
+              $IMAGE:$TAG
+          "
